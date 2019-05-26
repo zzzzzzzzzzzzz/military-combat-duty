@@ -1,0 +1,1483 @@
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET client_min_messages = warning;
+
+--
+-- Name: plpgsql; Type: EXTENSION; Schema: -; Owner: 
+--
+
+CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION plpgsql; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION plpgsql IS 'PL/pgSQL procedural language';
+
+
+--
+-- Name: check_commander(); Type: FUNCTION; Schema: public; Owner: administrator
+--
+
+CREATE FUNCTION public.check_commander() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE pid INTEGER;
+    BEGIN
+	RAISE NOTICE 'new gr_id is %', NEW.gr_id;
+        IF NEW.gr_id THEN
+            SELECT p_id INTO pid FROM groups_personnel WHERE is_commander=TRUE AND gr_id=NEW.gr_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Командир не назначен для группы %', NEW.gr_id;
+            END IF;
+        END IF;
+        RETURN NEW;
+    END;
+$$;
+
+
+ALTER FUNCTION public.check_commander() OWNER TO administrator;
+
+--
+-- Name: get_groups(timestamp with time zone, integer); Type: FUNCTION; Schema: public; Owner: administrator
+--
+
+CREATE FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) RETURNS TABLE(d_start timestamp without time zone, d_end timestamp without time zone, g_id integer, s_number integer)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE 
+    var_r record;
+    buffer INTEGER[];
+    elem INTEGER;
+BEGIN
+d_start := ForTime;
+d_end := ForTime + INTERVAL '1 DAY';
+ FOR var_r IN(
+SELECT
+	--serial_number,
+	--rs_name,
+	--range,
+	--array_agg(gr_id ORDER BY gr_id ASC) as gr_ids
+	gr_id,
+	array_agg(serial_number ORDER BY serial_number ASC) as serial_numbers
+FROM
+	(SELECT
+		serial_number,
+		rs_name,
+		range,
+		gr_id,
+		DENSE_RANK() OVER (PARTITION BY serial_number, rs_name ORDER BY range DESC, last_duty_rank DESC, equipment_last_duty_rank DESC, equipment_global_rank DESC) as priority
+	FROM
+		(SELECT 
+			serial_number,
+			rs_name,
+			range,
+			gr_id,
+			MIN(since_last_duty_days) OVER (PARTITION BY gr_id) AS last_duty_days_for_group,
+			DENSE_RANK() OVER (ORDER BY equipment_last_duty_days ASC) as equipment_global_rank,
+			DENSE_RANK() OVER (PARTITION BY gr_id ORDER BY equipment_last_duty_days ASC) as equipment_last_duty_rank,
+			DENSE_RANK() OVER (ORDER BY since_last_duty_days ASC) as last_duty_rank
+		FROM
+			(SELECT
+				serial_number,
+				rs_name,
+				range,
+				joined_with_log.gr_id,
+				CASE WHEN equipment IS NULL THEN 1000 ELSE since_last_duty_days END as equipment_last_duty_days,
+				CASE WHEN since_last_duty_days IS NULL THEN 1000 ELSE since_last_duty_days END as since_last_duty_days 
+			FROM
+				(SELECT 
+					serial_number,
+					rs_name,
+					range,
+					n_persons,
+					x.gr_id,
+					equipment,
+					since_last_duty_days
+				FROM
+					(SELECT
+						serial_number,
+						rs_name,
+						range,
+						n_persons,
+						gr_id
+					FROM
+						(SELECT 
+							serial_number,
+							rs_name,
+							range,
+							n_persons 
+						FROM 
+							inventory as a
+							INNER JOIN
+							radar_station as b
+							ON  a.rs_name = b.name
+						WHERE 
+							active=TRUE) as rs
+
+					INNER JOIN
+						duty_groups
+					ON rs.rs_name = duty_groups.for_station
+					ORDER BY range DESC) as x
+
+				LEFT OUTER JOIN
+
+					(SELECT
+						gr_id,
+						equipment,
+						MIN(DATE_PART('DAY', ForTime - duty_end)) OVER (PARTITION BY gr_id, equipment) as since_last_duty_days
+					FROM
+						duty_groups_log
+					WHERE duty_end > ForTime - INTERVAL '7 DAY') as y
+
+				ON x.gr_id = y.gr_id AND x.serial_number = y.equipment) as joined_with_log
+
+			INNER JOIN
+
+				(SELECT
+					gr_id,
+					COUNT(*) as onboard
+				FROM
+					groups_personnel
+				GROUP BY 
+					gr_id
+				) as people_in_groups
+
+			ON joined_with_log.gr_id = people_in_groups.gr_id
+			WHERE n_persons - onboard = 0)as source) as dense
+	WHERE last_duty_days_for_group >= RelaxDaysLimit
+	) as pre_final
+WHERE priority = 1
+GROUP BY gr_id
+ )  
+ LOOP
+        g_id := var_r.gr_id; 
+	FOREACH elem IN ARRAY var_r.serial_numbers
+	LOOP
+		IF (NOT (buffer @> ARRAY[elem::int]) OR buffer IS NULL) THEN
+			s_number := elem;
+			EXIT;
+		END IF;
+	END LOOP;
+	buffer := array_append(buffer, s_number);
+        RETURN NEXT;
+ END LOOP;
+END; $$;
+
+
+ALTER FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) OWNER TO administrator;
+
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- Name: duty_groups; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.duty_groups (
+    gr_id integer NOT NULL,
+    for_station character varying(255)
+);
+
+
+ALTER TABLE public.duty_groups OWNER TO administrator;
+
+--
+-- Name: TABLE duty_groups; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.duty_groups IS 'Дежурные расчёты, и их командиры';
+
+
+--
+-- Name: COLUMN duty_groups.for_station; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.duty_groups.for_station IS 'На каком типе оборудования работает расчёт';
+
+
+--
+-- Name: duty_groups_gr_id_seq; Type: SEQUENCE; Schema: public; Owner: administrator
+--
+
+CREATE SEQUENCE public.duty_groups_gr_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.duty_groups_gr_id_seq OWNER TO administrator;
+
+--
+-- Name: duty_groups_gr_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: administrator
+--
+
+ALTER SEQUENCE public.duty_groups_gr_id_seq OWNED BY public.duty_groups.gr_id;
+
+
+--
+-- Name: duty_groups_log; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.duty_groups_log (
+    duty_start timestamp with time zone NOT NULL,
+    duty_end timestamp with time zone NOT NULL,
+    equipment integer NOT NULL,
+    gr_id integer,
+    brief text[]
+);
+
+
+ALTER TABLE public.duty_groups_log OWNER TO administrator;
+
+--
+-- Name: TABLE duty_groups_log; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.duty_groups_log IS 'История работы дежурных расчётов. Кто, когда, где и на чём работали. Все записи уникальны на уровне первичного ключа';
+
+
+--
+-- Name: COLUMN duty_groups_log.brief; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.duty_groups_log.brief IS 'Текстовое описание состава дежурства';
+
+
+--
+-- Name: groups_personnel; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.groups_personnel (
+    gr_id integer NOT NULL,
+    p_id integer NOT NULL,
+    is_commander boolean DEFAULT false
+);
+
+
+ALTER TABLE public.groups_personnel OWNER TO administrator;
+
+--
+-- Name: TABLE groups_personnel; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.groups_personnel IS 'Информация о текущем составе расчётов.';
+
+
+--
+-- Name: COLUMN groups_personnel.p_id; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.groups_personnel.p_id IS 'Связь 1 к 1. Для простоты закладываем такое ограничение.';
+
+
+--
+-- Name: COLUMN groups_personnel.is_commander; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.groups_personnel.is_commander IS 'Является ли этот человек командиром расчёта.';
+
+
+--
+-- Name: radar_station; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.radar_station (
+    name character varying(255) NOT NULL,
+    range integer NOT NULL,
+    n_persons smallint NOT NULL,
+    CONSTRAINT n_persons_gr_than_zero CHECK ((n_persons > 0)),
+    CONSTRAINT range_gr_than_zero CHECK ((range > 0))
+);
+
+
+ALTER TABLE public.radar_station OWNER TO administrator;
+
+--
+-- Name: TABLE radar_station; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.radar_station IS 'Глоссарий радаров доступных в ВС РФ (или в этой ВЧ)';
+
+
+--
+-- Name: COLUMN radar_station.name; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.radar_station.name IS 'Имя (тип) РЛС';
+
+
+--
+-- Name: COLUMN radar_station.range; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.radar_station.range IS 'Радиус работы на средних и больших высотах (считаем, что зона покрытия примерно круг)';
+
+
+--
+-- Name: COLUMN radar_station.n_persons; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON COLUMN public.radar_station.n_persons IS 'Кол-во людей, нужное для обслуживания';
+
+
+--
+-- Name: duty_groups_people; Type: VIEW; Schema: public; Owner: administrator
+--
+
+CREATE VIEW public.duty_groups_people AS
+ SELECT duty_groups.gr_id,
+    radar_station.n_persons AS "Потребное кол-во людей",
+    cnt.onboard AS "Имеющееся кол-во людей",
+    cnt.commander AS "Назначен ли командир"
+   FROM ((public.duty_groups
+     JOIN public.radar_station ON (((duty_groups.for_station)::text = (radar_station.name)::text)))
+     JOIN ( SELECT groups_personnel.gr_id,
+            count(groups_personnel.p_id) AS onboard,
+            bool_or(groups_personnel.is_commander) AS commander
+           FROM public.groups_personnel
+          GROUP BY groups_personnel.gr_id) cnt ON ((duty_groups.gr_id = cnt.gr_id)));
+
+
+ALTER TABLE public.duty_groups_people OWNER TO administrator;
+
+--
+-- Name: personnel; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.personnel (
+    p_id integer NOT NULL,
+    surname character varying(255) NOT NULL,
+    name character varying(255) NOT NULL,
+    patronymic character varying(255),
+    status integer
+);
+
+
+ALTER TABLE public.personnel OWNER TO administrator;
+
+--
+-- Name: TABLE personnel; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.personnel IS 'Базовая информация о личном составе';
+
+
+--
+-- Name: group_info; Type: VIEW; Schema: public; Owner: administrator
+--
+
+CREATE VIEW public.group_info AS
+ SELECT x.gr_id,
+    array_agg(x.full_name) AS brief
+   FROM ( SELECT groups_personnel.gr_id,
+                CASE
+                    WHEN (groups_personnel.is_commander = true) THEN concat((personnel.p_id)::text, ':', 'КОМАНДИР:', personnel.surname, ' ', personnel.name, ' ', personnel.patronymic)
+                    ELSE concat((personnel.p_id)::text, ':', personnel.surname, ' ', personnel.name, ' ', personnel.patronymic)
+                END AS full_name
+           FROM (public.groups_personnel
+             JOIN public.personnel ON ((personnel.p_id = groups_personnel.p_id)))) x
+  GROUP BY x.gr_id
+  ORDER BY x.gr_id;
+
+
+ALTER TABLE public.group_info OWNER TO administrator;
+
+--
+-- Name: inventory; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.inventory (
+    serial_number integer NOT NULL,
+    rs_name character varying(255) NOT NULL,
+    active boolean DEFAULT true
+);
+
+
+ALTER TABLE public.inventory OWNER TO administrator;
+
+--
+-- Name: TABLE inventory; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.inventory IS 'Техника в составе военной части. Расположение РЛС оптимально, и не меняется';
+
+
+--
+-- Name: inventory_info; Type: VIEW; Schema: public; Owner: administrator
+--
+
+CREATE VIEW public.inventory_info AS
+ SELECT radar_station.name,
+    radar_station.range,
+    radar_station.n_persons,
+    inventory.serial_number,
+    inventory.active
+   FROM (public.inventory
+     JOIN public.radar_station ON (((inventory.rs_name)::text = (radar_station.name)::text)))
+  ORDER BY radar_station.name;
+
+
+ALTER TABLE public.inventory_info OWNER TO administrator;
+
+--
+-- Name: inventory_usage; Type: VIEW; Schema: public; Owner: administrator
+--
+
+CREATE VIEW public.inventory_usage AS
+ SELECT pre_final.serial_number,
+    pre_final.equipment_usage,
+    pre_final.rs_name
+   FROM ( SELECT inventory.serial_number,
+                CASE
+                    WHEN (x.usage IS NULL) THEN (0)::bigint
+                    ELSE x.usage
+                END AS equipment_usage,
+            inventory.rs_name
+           FROM (public.inventory
+             LEFT JOIN ( SELECT duty_groups_log.equipment,
+                    count(*) AS usage
+                   FROM public.duty_groups_log
+                  GROUP BY duty_groups_log.equipment) x ON ((inventory.serial_number = x.equipment)))) pre_final
+  ORDER BY pre_final.equipment_usage DESC;
+
+
+ALTER TABLE public.inventory_usage OWNER TO administrator;
+
+--
+-- Name: personnel_status; Type: TABLE; Schema: public; Owner: administrator; Tablespace: 
+--
+
+CREATE TABLE public.personnel_status (
+    id integer NOT NULL,
+    shortname character varying(50),
+    description character varying(255)
+);
+
+
+ALTER TABLE public.personnel_status OWNER TO administrator;
+
+--
+-- Name: TABLE personnel_status; Type: COMMENT; Schema: public; Owner: administrator
+--
+
+COMMENT ON TABLE public.personnel_status IS 'Состояния персонала, например, в отпуске или на больничном';
+
+
+--
+-- Name: personnel_info; Type: VIEW; Schema: public; Owner: administrator
+--
+
+CREATE VIEW public.personnel_info AS
+ SELECT personnel.p_id,
+    personnel.surname,
+    personnel.name,
+    personnel.patronymic,
+    personnel_status.shortname,
+    personnel_status.description
+   FROM (public.personnel
+     JOIN public.personnel_status ON ((personnel.status = personnel_status.id)));
+
+
+ALTER TABLE public.personnel_info OWNER TO administrator;
+
+--
+-- Name: personnel_p_id_seq; Type: SEQUENCE; Schema: public; Owner: administrator
+--
+
+CREATE SEQUENCE public.personnel_p_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.personnel_p_id_seq OWNER TO administrator;
+
+--
+-- Name: personnel_p_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: administrator
+--
+
+ALTER SEQUENCE public.personnel_p_id_seq OWNED BY public.personnel.p_id;
+
+
+--
+-- Name: personnel_status_id_seq; Type: SEQUENCE; Schema: public; Owner: administrator
+--
+
+CREATE SEQUENCE public.personnel_status_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.personnel_status_id_seq OWNER TO administrator;
+
+--
+-- Name: personnel_status_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: administrator
+--
+
+ALTER SEQUENCE public.personnel_status_id_seq OWNED BY public.personnel_status.id;
+
+
+--
+-- Name: gr_id; Type: DEFAULT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.duty_groups ALTER COLUMN gr_id SET DEFAULT nextval('public.duty_groups_gr_id_seq'::regclass);
+
+
+--
+-- Name: p_id; Type: DEFAULT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.personnel ALTER COLUMN p_id SET DEFAULT nextval('public.personnel_p_id_seq'::regclass);
+
+
+--
+-- Name: id; Type: DEFAULT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.personnel_status ALTER COLUMN id SET DEFAULT nextval('public.personnel_status_id_seq'::regclass);
+
+
+--
+-- Data for Name: duty_groups; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.duty_groups (gr_id, for_station) FROM stdin;
+1	5Н84А Оборона-14
+2	Небо-У
+3	Гамма-С1Е
+4	Противник-ГЕ
+5	5Н84А Оборона-14
+7	5Н84А Оборона-14
+8	Противник-ГЕ
+9	5Н84А Оборона-14
+10	Небо-У
+13	Противник-ГЕ
+14	Небо-У
+15	Противник-ГЕ
+16	Гамма-С1Е
+17	5Н84А Оборона-14
+18	Небо-У
+19	Гамма-С1Е
+20	Гамма-С1Е
+21	5Н84А Оборона-14
+22	Гамма-С1Е
+23	Противник-ГЕ
+24	Небо-У
+25	Противник-ГЕ
+26	Гамма-С1Е
+27	5Н84А Оборона-14
+28	Небо-У
+29	Гамма-С1Е
+30	Гамма-С1Е
+31	5Н84А Оборона-14
+32	Гамма-С1Е
+\.
+
+
+--
+-- Name: duty_groups_gr_id_seq; Type: SEQUENCE SET; Schema: public; Owner: administrator
+--
+
+SELECT pg_catalog.setval('public.duty_groups_gr_id_seq', 32, true);
+
+
+--
+-- Data for Name: duty_groups_log; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.duty_groups_log (duty_start, duty_end, equipment, gr_id, brief) FROM stdin;
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	1814408	8	{"59:КОМАНДИР:Ушаков Валерий Иванович","60:Петров Вадим Петрович","61:Захаров Михаил Иванович"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	646646	1	{"11:КОМАНДИР:Горбачёв Анатолий Анатольевич","12:Захаров Анатолий Иванович","13:Захаров Геннадий Андреевич","14:Сидоров Иван Денисович","15:Захаров Андрей Денисович","16:Ушаков Андрей Иванович","17:Сидоров Валерий Анатольевич","18:Гончаров Михаил Петрович","19:Чесноков Пётр Анатольевич","20:Иванов Михаил Денисович","21:Сидоров Валерий Васильевич","22:Сидоров Иван Петрович"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	5525912	2	{"23:КОМАНДИР:Горбачёв Пётр Денисович","24:Ушаков Валерий Денисович","25:Ушаков Валерий Анатольевич"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	1677862	3	{"26:КОМАНДИР:Соловьёв Андрей Васильевич","27:Ушаков Анатолий Васильевич","28:Ушаков Михаил Денисович"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	7353109	10	{"74:КОМАНДИР:Иванов Всеволод Петрович","75:Гончаров Геннадий Анатольевич","76:Петров Андрей Сергеевич"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	64364	4	{"29:КОМАНДИР:Гончаров Геннадий Анатольевич","30:Петров Вадим Андреевич","31:Чесноков Пётр Андреевич"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	1856258	5	{"32:КОМАНДИР:Сидоров Всеволод Петрович","33:Соловьёв Сергей Васильевич","34:Иванов Пётр Андреевич","35:Сидоров Михаил Анатольевич","36:Сидоров Валерий Петрович","37:Ушаков Андрей Анатольевич","38:Чесноков Анатолий Петрович","39:Горбачёв Андрей Петрович","40:Соловьёв Вадим Андреевич","41:Сидоров Иван Сергеевич","42:Гончаров Всеволод Петрович","43:Соловьёв Всеволод Сергеевич"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	4149830	9	{"62:КОМАНДИР:Соловьёв Анатолий Васильевич","63:Горбачёв Михаил Андреевич","64:Гончаров Михаил Денисович","65:Ушаков Андрей Иванович","66:Сидоров Анатолий Петрович","67:Горбачёв Геннадий Петрович","68:Гончаров Валерий Васильевич","69:Иванов Геннадий Анатольевич","70:Соловьёв Михаил Васильевич","71:Захаров Геннадий Васильевич","72:Иванов Анатолий Анатольевич","73:Соловьёв Вадим Васильевич"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	2230700	7	{"47:КОМАНДИР:Ушаков Анатолий Петрович","48:Иванов Иван Андреевич","49:Горбачёв Вадим Андреевич","50:Захаров Пётр Сергеевич","51:Горбачёв Иван Петрович","52:Горбачёв Сергей Иванович","53:Соловьёв Валерий Денисович","54:Иванов Иван Андреевич","55:Гончаров Всеволод Иванович","56:Сидоров Сергей Андреевич","57:Горбачёв Иван Андреевич","58:Сидоров Пётр Петрович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	64364	13	{"77:КОМАНДИР:Горбачёв Всеволод Петрович","78:Горбачёв Вадим Петрович","79:Горбачёв Андрей Денисович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	5525912	14	{"80:КОМАНДИР:Петров Вадим Андреевич","81:Ушаков Валерий Анатольевич","82:Петров Михаил Петрович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	1814408	15	{"83:КОМАНДИР:Чесноков Иван Петрович","84:Иванов Всеволод Иванович","85:Ушаков Валерий Иванович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	1677862	16	{"86:КОМАНДИР:Горбачёв Михаил Иванович","87:Горбачёв Валерий Денисович","88:Гончаров Анатолий Сергеевич"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	646646	17	{"89:КОМАНДИР:Иванов Андрей Сергеевич","90:Петров Михаил Андреевич","91:Чесноков Вадим Денисович","92:Соловьёв Валерий Сергеевич","93:Ушаков Михаил Васильевич","94:Ушаков Иван Денисович","95:Петров Валерий Васильевич","96:Сидоров Сергей Петрович","97:Сидоров Сергей Денисович","98:Горбачёв Иван Иванович","99:Захаров Вадим Геннадиевич","100:Сидоров Сергей Геннадиевич"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	5724333	18	{"101:КОМАНДИР:Чесноков Андрей Андреевич","102:Гончаров Иван Геннадиевич","103:Сидоров Анатолий Васильевич"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	2929970	19	{"104:КОМАНДИР:Захаров Валерий Денисович","105:Горбачёв Вадим Анатольевич","106:Сидоров Михаил Петрович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	3265064	20	{"107:КОМАНДИР:Гончаров Геннадий Васильевич","108:Захаров Всеволод Геннадиевич","109:Захаров Валерий Денисович"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	1856258	21	{"110:КОМАНДИР:Гончаров Иван Геннадиевич","111:Сидоров Михаил Анатольевич","112:Петров Иван Петрович","113:Ушаков Михаил Иванович","114:Соловьёв Пётр Анатольевич","115:Гончаров Геннадий Васильевич","116:Иванов Анатолий Геннадиевич","117:Сидоров Вадим Анатольевич","118:Ушаков Геннадий Андреевич","119:Ушаков Михаил Денисович","120:Ушаков Геннадий Геннадиевич","121:Чесноков Пётр Геннадиевич"}
+2019-04-02 18:00:00+03	2019-04-03 18:00:00+03	4953740	22	{"122:КОМАНДИР:Соловьёв Михаил Сергеевич","123:Ушаков Иван Сергеевич","124:Соловьёв Михаил Петрович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	64364	23	{"125:КОМАНДИР:Чесноков Иван Петрович","126:Соловьёв Валерий Андреевич","127:Захаров Валерий Иванович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	5525912	24	{"128:КОМАНДИР:Чесноков Геннадий Геннадиевич","129:Ушаков Пётр Андреевич","130:Сидоров Анатолий Петрович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	1814408	25	{"131:КОМАНДИР:Петров Всеволод Геннадиевич","132:Гончаров Геннадий Петрович","133:Захаров Михаил Денисович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	1677862	26	{"134:КОМАНДИР:Сидоров Иван Петрович","135:Соловьёв Геннадий Петрович","136:Горбачёв Геннадий Иванович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	646646	27	{"137:КОМАНДИР:Сидоров Пётр Денисович","138:Петров Иван Денисович","139:Иванов Михаил Денисович","140:Соловьёв Михаил Петрович","141:Иванов Сергей Васильевич","142:Чесноков Валерий Анатольевич","143:Ушаков Анатолий Васильевич","144:Чесноков Пётр Андреевич","145:Гончаров Анатолий Сергеевич","146:Горбачёв Валерий Васильевич","147:Петров Пётр Иванович","148:Иванов Андрей Васильевич"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	5724333	28	{"149:КОМАНДИР:Соловьёв Анатолий Андреевич","150:Иванов Пётр Андреевич","151:Сидоров Вадим Иванович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	2929970	29	{"152:КОМАНДИР:Иванов Анатолий Иванович","153:Ушаков Геннадий Геннадиевич","154:Соловьёв Андрей Анатольевич"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	3265064	30	{"155:КОМАНДИР:Петров Иван Иванович","156:Иванов Иван Геннадиевич","157:Горбачёв Пётр Петрович"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	1856258	31	{"158:КОМАНДИР:Соловьёв Пётр Андреевич","159:Петров Сергей Геннадиевич","160:Сидоров Геннадий Иванович","161:Иванов Иван Сергеевич","162:Горбачёв Михаил Андреевич","163:Чесноков Всеволод Васильевич","164:Сидоров Анатолий Сергеевич","165:Ушаков Анатолий Денисович","166:Чесноков Всеволод Анатольевич","167:Ушаков Всеволод Геннадиевич","168:Иванов Анатолий Денисович","169:Петров Сергей Геннадиевич"}
+2019-04-03 18:00:00+03	2019-04-04 18:00:00+03	4953740	32	{"170:КОМАНДИР:Горбачёв Всеволод Анатольевич","171:Захаров Геннадий Геннадиевич","172:Захаров Михаил Иванович"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	1856258	1	{"11:КОМАНДИР:Горбачёв Анатолий Анатольевич","12:Захаров Анатолий Иванович","13:Захаров Геннадий Андреевич","14:Сидоров Иван Денисович","15:Захаров Андрей Денисович","16:Ушаков Андрей Иванович","17:Сидоров Валерий Анатольевич","18:Гончаров Михаил Петрович","19:Чесноков Пётр Анатольевич","20:Иванов Михаил Денисович","21:Сидоров Валерий Васильевич","22:Сидоров Иван Петрович"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	5724333	2	{"23:КОМАНДИР:Горбачёв Пётр Денисович","24:Ушаков Валерий Денисович","25:Ушаков Валерий Анатольевич"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	1677862	3	{"26:КОМАНДИР:Соловьёв Андрей Васильевич","27:Ушаков Анатолий Васильевич","28:Ушаков Михаил Денисович"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	1814408	4	{"29:КОМАНДИР:Гончаров Геннадий Анатольевич","30:Петров Вадим Андреевич","31:Чесноков Пётр Андреевич"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	646646	5	{"32:КОМАНДИР:Сидоров Всеволод Петрович","33:Соловьёв Сергей Васильевич","34:Иванов Пётр Андреевич","35:Сидоров Михаил Анатольевич","36:Сидоров Валерий Петрович","37:Ушаков Андрей Анатольевич","38:Чесноков Анатолий Петрович","39:Горбачёв Андрей Петрович","40:Соловьёв Вадим Андреевич","41:Сидоров Иван Сергеевич","42:Гончаров Всеволод Петрович","43:Соловьёв Всеволод Сергеевич"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	4149830	7	{"47:КОМАНДИР:Ушаков Анатолий Петрович","48:Иванов Иван Андреевич","49:Горбачёв Вадим Андреевич","50:Захаров Пётр Сергеевич","51:Горбачёв Иван Петрович","52:Горбачёв Сергей Иванович","53:Соловьёв Валерий Денисович","54:Иванов Иван Андреевич","55:Гончаров Всеволод Иванович","56:Сидоров Сергей Андреевич","57:Горбачёв Иван Андреевич","58:Сидоров Пётр Петрович"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	64364	8	{"59:КОМАНДИР:Ушаков Валерий Иванович","60:Петров Вадим Петрович","61:Захаров Михаил Иванович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	3265064	32	{"170:КОМАНДИР:Горбачёв Всеволод Анатольевич","171:Захаров Геннадий Геннадиевич","172:Захаров Михаил Иванович"}
+2019-04-01 18:00:00+03	2019-04-02 18:00:00+03	5724333	\N	{"44:КОМАНДИР:Гончаров Михаил Денисович","45:Ушаков Вадим Андреевич","46:Петров Вадим Петрович"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	2230700	9	{"62:КОМАНДИР:Соловьёв Анатолий Васильевич","63:Горбачёв Михаил Андреевич","64:Гончаров Михаил Денисович","65:Ушаков Андрей Иванович","66:Сидоров Анатолий Петрович","67:Горбачёв Геннадий Петрович","68:Гончаров Валерий Васильевич","69:Иванов Геннадий Анатольевич","70:Соловьёв Михаил Васильевич","71:Захаров Геннадий Васильевич","72:Иванов Анатолий Анатольевич","73:Соловьёв Вадим Васильевич"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	8258910	10	{"74:КОМАНДИР:Иванов Всеволод Петрович","75:Гончаров Геннадий Анатольевич","76:Петров Андрей Сергеевич"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	1814408	13	{"77:КОМАНДИР:Горбачёв Всеволод Петрович","78:Горбачёв Вадим Петрович","79:Горбачёв Андрей Денисович"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	5724333	14	{"80:КОМАНДИР:Петров Вадим Андреевич","81:Ушаков Валерий Анатольевич","82:Петров Михаил Петрович"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	64364	15	{"83:КОМАНДИР:Чесноков Иван Петрович","84:Иванов Всеволод Иванович","85:Ушаков Валерий Иванович"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	2929970	16	{"86:КОМАНДИР:Горбачёв Михаил Иванович","87:Горбачёв Валерий Денисович","88:Гончаров Анатолий Сергеевич"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	1856258	17	{"89:КОМАНДИР:Иванов Андрей Сергеевич","90:Петров Михаил Андреевич","91:Чесноков Вадим Денисович","92:Соловьёв Валерий Сергеевич","93:Ушаков Михаил Васильевич","94:Ушаков Иван Денисович","95:Петров Валерий Васильевич","96:Сидоров Сергей Петрович","97:Сидоров Сергей Денисович","98:Горбачёв Иван Иванович","99:Захаров Вадим Геннадиевич","100:Сидоров Сергей Геннадиевич"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	5525912	18	{"101:КОМАНДИР:Чесноков Андрей Андреевич","102:Гончаров Иван Геннадиевич","103:Сидоров Анатолий Васильевич"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	1677862	19	{"104:КОМАНДИР:Захаров Валерий Денисович","105:Горбачёв Вадим Анатольевич","106:Сидоров Михаил Петрович"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	4953740	20	{"107:КОМАНДИР:Гончаров Геннадий Васильевич","108:Захаров Всеволод Геннадиевич","109:Захаров Валерий Денисович"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	646646	21	{"110:КОМАНДИР:Гончаров Иван Геннадиевич","111:Сидоров Михаил Анатольевич","112:Петров Иван Петрович","113:Ушаков Михаил Иванович","114:Соловьёв Пётр Анатольевич","115:Гончаров Геннадий Васильевич","116:Иванов Анатолий Геннадиевич","117:Сидоров Вадим Анатольевич","118:Ушаков Геннадий Андреевич","119:Ушаков Михаил Денисович","120:Ушаков Геннадий Геннадиевич","121:Чесноков Пётр Геннадиевич"}
+2019-04-05 18:00:00+03	2019-04-06 18:00:00+03	3265064	22	{"122:КОМАНДИР:Соловьёв Михаил Сергеевич","123:Ушаков Иван Сергеевич","124:Соловьёв Михаил Петрович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	1814408	23	{"125:КОМАНДИР:Чесноков Иван Петрович","126:Соловьёв Валерий Андреевич","127:Захаров Валерий Иванович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	5724333	24	{"128:КОМАНДИР:Чесноков Геннадий Геннадиевич","129:Ушаков Пётр Андреевич","130:Сидоров Анатолий Петрович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	64364	25	{"131:КОМАНДИР:Петров Всеволод Геннадиевич","132:Гончаров Геннадий Петрович","133:Захаров Михаил Денисович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	2929970	26	{"134:КОМАНДИР:Сидоров Иван Петрович","135:Соловьёв Геннадий Петрович","136:Горбачёв Геннадий Иванович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	1856258	27	{"137:КОМАНДИР:Сидоров Пётр Денисович","138:Петров Иван Денисович","139:Иванов Михаил Денисович","140:Соловьёв Михаил Петрович","141:Иванов Сергей Васильевич","142:Чесноков Валерий Анатольевич","143:Ушаков Анатолий Васильевич","144:Чесноков Пётр Андреевич","145:Гончаров Анатолий Сергеевич","146:Горбачёв Валерий Васильевич","147:Петров Пётр Иванович","148:Иванов Андрей Васильевич"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	5525912	28	{"149:КОМАНДИР:Соловьёв Анатолий Андреевич","150:Иванов Пётр Андреевич","151:Сидоров Вадим Иванович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	1677862	29	{"152:КОМАНДИР:Иванов Анатолий Иванович","153:Ушаков Геннадий Геннадиевич","154:Соловьёв Андрей Анатольевич"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	4953740	30	{"155:КОМАНДИР:Петров Иван Иванович","156:Иванов Иван Геннадиевич","157:Горбачёв Пётр Петрович"}
+2019-04-06 18:00:00+03	2019-04-07 18:00:00+03	646646	31	{"158:КОМАНДИР:Соловьёв Пётр Андреевич","159:Петров Сергей Геннадиевич","160:Сидоров Геннадий Иванович","161:Иванов Иван Сергеевич","162:Горбачёв Михаил Андреевич","163:Чесноков Всеволод Васильевич","164:Сидоров Анатолий Сергеевич","165:Ушаков Анатолий Денисович","166:Чесноков Всеволод Анатольевич","167:Ушаков Всеволод Геннадиевич","168:Иванов Анатолий Денисович","169:Петров Сергей Геннадиевич"}
+2019-04-04 18:00:00+03	2019-04-05 18:00:00+03	5525912	\N	{"44:КОМАНДИР:Гончаров Михаил Денисович","45:Ушаков Вадим Андреевич","46:Петров Вадим Петрович"}
+\.
+
+
+--
+-- Data for Name: groups_personnel; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.groups_personnel (gr_id, p_id, is_commander) FROM stdin;
+1	11	t
+1	12	f
+1	13	f
+1	14	f
+1	15	f
+1	16	f
+1	17	f
+1	18	f
+1	19	f
+1	20	f
+1	21	f
+1	22	f
+2	23	t
+2	24	f
+2	25	f
+3	26	t
+3	27	f
+3	28	f
+4	29	t
+4	30	f
+4	31	f
+5	32	t
+5	33	f
+5	34	f
+5	35	f
+5	36	f
+5	37	f
+5	38	f
+5	39	f
+5	40	f
+5	41	f
+5	42	f
+5	43	f
+7	47	t
+7	48	f
+7	49	f
+7	50	f
+7	51	f
+7	52	f
+7	53	f
+7	54	f
+7	55	f
+7	56	f
+7	57	f
+7	58	f
+8	59	t
+8	60	f
+8	61	f
+9	62	t
+9	63	f
+9	64	f
+9	65	f
+9	66	f
+9	67	f
+9	68	f
+9	69	f
+9	70	f
+9	71	f
+9	72	f
+9	73	f
+10	74	t
+10	75	f
+10	76	f
+21	121	f
+13	77	t
+13	78	f
+13	79	f
+14	80	t
+14	81	f
+14	82	f
+15	83	t
+15	84	f
+15	85	f
+16	86	t
+16	87	f
+16	88	f
+17	89	t
+17	90	f
+17	91	f
+17	92	f
+17	93	f
+17	94	f
+17	95	f
+17	96	f
+17	97	f
+17	98	f
+17	99	f
+17	100	f
+18	101	t
+18	102	f
+18	103	f
+19	104	t
+19	105	f
+19	106	f
+20	107	t
+20	108	f
+20	109	f
+21	110	t
+21	111	f
+21	112	f
+21	113	f
+21	114	f
+21	115	f
+21	116	f
+21	117	f
+21	118	f
+21	119	f
+21	120	f
+22	122	t
+22	123	f
+22	124	f
+23	125	t
+23	126	f
+23	127	f
+24	128	t
+24	129	f
+24	130	f
+25	131	t
+25	132	f
+25	133	f
+26	134	t
+26	135	f
+26	136	f
+27	137	t
+27	138	f
+27	139	f
+27	140	f
+27	141	f
+27	142	f
+27	143	f
+27	144	f
+27	145	f
+27	146	f
+27	147	f
+27	148	f
+28	149	t
+28	150	f
+28	151	f
+29	152	t
+29	153	f
+29	154	f
+30	155	t
+30	156	f
+30	157	f
+31	158	t
+31	159	f
+31	160	f
+31	161	f
+31	162	f
+31	163	f
+31	164	f
+31	165	f
+31	166	f
+31	167	f
+31	168	f
+31	169	f
+32	170	t
+32	171	f
+32	172	f
+\.
+
+
+--
+-- Data for Name: inventory; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.inventory (serial_number, rs_name, active) FROM stdin;
+6407908	5Н84А Оборона-14	t
+2270048	Противник-ГЕ	t
+4953740	Гамма-С1Е	t
+1814408	Противник-ГЕ	t
+646646	5Н84А Оборона-14	t
+9073260	Небо-У	t
+1677862	Гамма-С1Е	t
+9689204	Небо-У	t
+5724333	Небо-У	t
+64364	Противник-ГЕ	t
+7066580	5Н84А Оборона-14	t
+2230700	5Н84А Оборона-14	t
+6712937	Противник-ГЕ	t
+8246731	Противник-ГЕ	t
+9480316	Противник-ГЕ	t
+1856258	5Н84А Оборона-14	t
+8258910	Небо-У	t
+4168258	Противник-ГЕ	t
+2929970	Гамма-С1Е	t
+3265064	Гамма-С1Е	t
+5583361	Гамма-С1Е	t
+9414961	Противник-ГЕ	t
+4149830	5Н84А Оборона-14	t
+7353109	Небо-У	t
+9501900	Противник-ГЕ	t
+5534645	Гамма-С1Е	t
+6877808	5Н84А Оборона-14	t
+5525912	Небо-У	t
+5246678	Противник-ГЕ	t
+6637779	Противник-ГЕ	f
+\.
+
+
+--
+-- Data for Name: personnel; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.personnel (p_id, surname, name, patronymic, status) FROM stdin;
+1	Гончаров	Пётр	Анатольевич	1
+2	Гончаров	Анатолий	Петрович	1
+3	Сидоров	Иван	Сергеевич	1
+4	Чесноков	Геннадий	Андреевич	1
+5	Иванов	Всеволод	Андреевич	1
+6	Соловьёв	Вадим	Анатольевич	1
+7	Захаров	Андрей	Геннадиевич	1
+8	Петров	Андрей	Иванович	1
+9	Захаров	Всеволод	Васильевич	1
+10	Соловьёв	Всеволод	Сергеевич	1
+11	Горбачёв	Анатолий	Анатольевич	1
+12	Захаров	Анатолий	Иванович	1
+13	Захаров	Геннадий	Андреевич	1
+14	Сидоров	Иван	Денисович	1
+15	Захаров	Андрей	Денисович	1
+16	Ушаков	Андрей	Иванович	1
+17	Сидоров	Валерий	Анатольевич	1
+18	Гончаров	Михаил	Петрович	1
+19	Чесноков	Пётр	Анатольевич	1
+20	Иванов	Михаил	Денисович	1
+21	Сидоров	Валерий	Васильевич	1
+22	Сидоров	Иван	Петрович	1
+23	Горбачёв	Пётр	Денисович	1
+24	Ушаков	Валерий	Денисович	1
+25	Ушаков	Валерий	Анатольевич	1
+26	Соловьёв	Андрей	Васильевич	1
+27	Ушаков	Анатолий	Васильевич	1
+28	Ушаков	Михаил	Денисович	1
+29	Гончаров	Геннадий	Анатольевич	1
+30	Петров	Вадим	Андреевич	1
+31	Чесноков	Пётр	Андреевич	1
+32	Сидоров	Всеволод	Петрович	1
+33	Соловьёв	Сергей	Васильевич	1
+34	Иванов	Пётр	Андреевич	1
+35	Сидоров	Михаил	Анатольевич	1
+36	Сидоров	Валерий	Петрович	1
+37	Ушаков	Андрей	Анатольевич	1
+38	Чесноков	Анатолий	Петрович	1
+39	Горбачёв	Андрей	Петрович	1
+40	Соловьёв	Вадим	Андреевич	1
+41	Сидоров	Иван	Сергеевич	1
+42	Гончаров	Всеволод	Петрович	1
+43	Соловьёв	Всеволод	Сергеевич	1
+44	Гончаров	Михаил	Денисович	1
+45	Ушаков	Вадим	Андреевич	1
+46	Петров	Вадим	Петрович	1
+47	Ушаков	Анатолий	Петрович	1
+48	Иванов	Иван	Андреевич	1
+49	Горбачёв	Вадим	Андреевич	1
+50	Захаров	Пётр	Сергеевич	1
+51	Горбачёв	Иван	Петрович	1
+52	Горбачёв	Сергей	Иванович	1
+53	Соловьёв	Валерий	Денисович	1
+54	Иванов	Иван	Андреевич	1
+55	Гончаров	Всеволод	Иванович	1
+56	Сидоров	Сергей	Андреевич	1
+57	Горбачёв	Иван	Андреевич	1
+58	Сидоров	Пётр	Петрович	1
+59	Ушаков	Валерий	Иванович	1
+60	Петров	Вадим	Петрович	1
+61	Захаров	Михаил	Иванович	1
+62	Соловьёв	Анатолий	Васильевич	1
+63	Горбачёв	Михаил	Андреевич	1
+64	Гончаров	Михаил	Денисович	1
+65	Ушаков	Андрей	Иванович	1
+66	Сидоров	Анатолий	Петрович	1
+67	Горбачёв	Геннадий	Петрович	1
+68	Гончаров	Валерий	Васильевич	1
+69	Иванов	Геннадий	Анатольевич	1
+70	Соловьёв	Михаил	Васильевич	1
+71	Захаров	Геннадий	Васильевич	1
+72	Иванов	Анатолий	Анатольевич	1
+73	Соловьёв	Вадим	Васильевич	1
+74	Иванов	Всеволод	Петрович	1
+75	Гончаров	Геннадий	Анатольевич	1
+76	Петров	Андрей	Сергеевич	1
+77	Горбачёв	Всеволод	Петрович	1
+78	Горбачёв	Вадим	Петрович	1
+79	Горбачёв	Андрей	Денисович	1
+80	Петров	Вадим	Андреевич	1
+81	Ушаков	Валерий	Анатольевич	1
+82	Петров	Михаил	Петрович	1
+83	Чесноков	Иван	Петрович	1
+84	Иванов	Всеволод	Иванович	1
+85	Ушаков	Валерий	Иванович	1
+86	Горбачёв	Михаил	Иванович	1
+87	Горбачёв	Валерий	Денисович	1
+88	Гончаров	Анатолий	Сергеевич	1
+89	Иванов	Андрей	Сергеевич	1
+90	Петров	Михаил	Андреевич	1
+91	Чесноков	Вадим	Денисович	1
+92	Соловьёв	Валерий	Сергеевич	1
+93	Ушаков	Михаил	Васильевич	1
+94	Ушаков	Иван	Денисович	1
+95	Петров	Валерий	Васильевич	1
+96	Сидоров	Сергей	Петрович	1
+97	Сидоров	Сергей	Денисович	1
+98	Горбачёв	Иван	Иванович	1
+99	Захаров	Вадим	Геннадиевич	1
+100	Сидоров	Сергей	Геннадиевич	1
+101	Чесноков	Андрей	Андреевич	1
+102	Гончаров	Иван	Геннадиевич	1
+103	Сидоров	Анатолий	Васильевич	1
+104	Захаров	Валерий	Денисович	1
+105	Горбачёв	Вадим	Анатольевич	1
+106	Сидоров	Михаил	Петрович	1
+107	Гончаров	Геннадий	Васильевич	1
+108	Захаров	Всеволод	Геннадиевич	1
+109	Захаров	Валерий	Денисович	1
+110	Гончаров	Иван	Геннадиевич	1
+111	Сидоров	Михаил	Анатольевич	1
+112	Петров	Иван	Петрович	1
+113	Ушаков	Михаил	Иванович	1
+114	Соловьёв	Пётр	Анатольевич	1
+115	Гончаров	Геннадий	Васильевич	1
+116	Иванов	Анатолий	Геннадиевич	1
+117	Сидоров	Вадим	Анатольевич	1
+118	Ушаков	Геннадий	Андреевич	1
+119	Ушаков	Михаил	Денисович	1
+120	Ушаков	Геннадий	Геннадиевич	1
+121	Чесноков	Пётр	Геннадиевич	1
+122	Соловьёв	Михаил	Сергеевич	1
+123	Ушаков	Иван	Сергеевич	1
+124	Соловьёв	Михаил	Петрович	1
+125	Чесноков	Иван	Петрович	1
+126	Соловьёв	Валерий	Андреевич	1
+127	Захаров	Валерий	Иванович	1
+128	Чесноков	Геннадий	Геннадиевич	1
+129	Ушаков	Пётр	Андреевич	1
+130	Сидоров	Анатолий	Петрович	1
+131	Петров	Всеволод	Геннадиевич	1
+132	Гончаров	Геннадий	Петрович	1
+133	Захаров	Михаил	Денисович	1
+134	Сидоров	Иван	Петрович	1
+135	Соловьёв	Геннадий	Петрович	1
+136	Горбачёв	Геннадий	Иванович	1
+137	Сидоров	Пётр	Денисович	1
+138	Петров	Иван	Денисович	1
+139	Иванов	Михаил	Денисович	1
+140	Соловьёв	Михаил	Петрович	1
+141	Иванов	Сергей	Васильевич	1
+142	Чесноков	Валерий	Анатольевич	1
+143	Ушаков	Анатолий	Васильевич	1
+144	Чесноков	Пётр	Андреевич	1
+145	Гончаров	Анатолий	Сергеевич	1
+146	Горбачёв	Валерий	Васильевич	1
+147	Петров	Пётр	Иванович	1
+148	Иванов	Андрей	Васильевич	1
+149	Соловьёв	Анатолий	Андреевич	1
+150	Иванов	Пётр	Андреевич	1
+151	Сидоров	Вадим	Иванович	1
+152	Иванов	Анатолий	Иванович	1
+153	Ушаков	Геннадий	Геннадиевич	1
+154	Соловьёв	Андрей	Анатольевич	1
+155	Петров	Иван	Иванович	1
+156	Иванов	Иван	Геннадиевич	1
+157	Горбачёв	Пётр	Петрович	1
+158	Соловьёв	Пётр	Андреевич	1
+159	Петров	Сергей	Геннадиевич	1
+160	Сидоров	Геннадий	Иванович	1
+161	Иванов	Иван	Сергеевич	1
+162	Горбачёв	Михаил	Андреевич	1
+163	Чесноков	Всеволод	Васильевич	1
+164	Сидоров	Анатолий	Сергеевич	1
+165	Ушаков	Анатолий	Денисович	1
+166	Чесноков	Всеволод	Анатольевич	1
+167	Ушаков	Всеволод	Геннадиевич	1
+168	Иванов	Анатолий	Денисович	1
+169	Петров	Сергей	Геннадиевич	1
+170	Горбачёв	Всеволод	Анатольевич	1
+171	Захаров	Геннадий	Геннадиевич	1
+172	Захаров	Михаил	Иванович	1
+173	Ушаков	Вадим	Геннадиевич	1
+174	Сидоров	Валерий	Андреевич	1
+175	Горбачёв	Анатолий	Петрович	1
+176	Горбачёв	Анатолий	Сергеевич	1
+177	Сидоров	Иван	Геннадиевич	1
+178	Чесноков	Всеволод	Геннадиевич	1
+179	Соловьёв	Пётр	Анатольевич	1
+180	Гончаров	Иван	Сергеевич	1
+181	Иванов	Всеволод	Анатольевич	1
+182	Соловьёв	Иван	Иванович	1
+183	Чесноков	Пётр	Петрович	1
+184	Захаров	Андрей	Геннадиевич	1
+185	Горбачёв	Сергей	Геннадиевич	1
+186	Гончаров	Вадим	Геннадиевич	1
+187	Иванов	Вадим	Андреевич	1
+188	Иванов	Валерий	Сергеевич	1
+189	Чесноков	Вадим	Сергеевич	1
+190	Ушаков	Вадим	Денисович	1
+191	Горбачёв	Андрей	Васильевич	1
+192	Петров	Андрей	Петрович	1
+193	Захаров	Михаил	Васильевич	1
+194	Захаров	Всеволод	Анатольевич	1
+195	Гончаров	Валерий	Иванович	1
+196	Захаров	Геннадий	Геннадиевич	1
+197	Горбачёв	Андрей	Андреевич	1
+198	Горбачёв	Сергей	Петрович	1
+199	Захаров	Иван	Денисович	1
+200	Чесноков	Анатолий	Петрович	1
+201	Ушаков	Вадим	Геннадиевич	1
+202	Гончаров	Сергей	Васильевич	1
+203	Горбачёв	Пётр	Петрович	1
+204	Ушаков	Сергей	Геннадиевич	1
+205	Гончаров	Геннадий	Петрович	1
+206	Соловьёв	Сергей	Васильевич	1
+207	Соловьёв	Иван	Денисович	1
+208	Чесноков	Андрей	Анатольевич	1
+209	Сидоров	Андрей	Анатольевич	1
+210	Гончаров	Иван	Сергеевич	1
+211	Соловьёв	Валерий	Денисович	1
+212	Иванов	Михаил	Васильевич	1
+213	Соловьёв	Анатолий	Анатольевич	1
+214	Гончаров	Пётр	Иванович	1
+215	Сидоров	Вадим	Васильевич	1
+216	Чесноков	Вадим	Андреевич	1
+217	Петров	Валерий	Денисович	1
+218	Чесноков	Пётр	Андреевич	1
+219	Иванов	Пётр	Денисович	1
+220	Петров	Всеволод	Анатольевич	1
+221	Гончаров	Всеволод	Иванович	1
+222	Горбачёв	Геннадий	Геннадиевич	1
+223	Ушаков	Михаил	Денисович	1
+224	Сидоров	Сергей	Васильевич	1
+225	Горбачёв	Иван	Васильевич	1
+226	Ушаков	Вадим	Иванович	1
+227	Горбачёв	Валерий	Васильевич	1
+228	Иванов	Вадим	Иванович	1
+229	Иванов	Пётр	Васильевич	1
+230	Иванов	Анатолий	Геннадиевич	1
+231	Горбачёв	Вадим	Петрович	1
+232	Чесноков	Анатолий	Андреевич	1
+233	Сидоров	Валерий	Васильевич	1
+234	Захаров	Геннадий	Геннадиевич	1
+235	Соловьёв	Иван	Иванович	1
+236	Сидоров	Анатолий	Иванович	1
+237	Горбачёв	Андрей	Андреевич	1
+238	Горбачёв	Андрей	Сергеевич	1
+239	Петров	Иван	Петрович	1
+240	Гончаров	Валерий	Анатольевич	1
+241	Ушаков	Сергей	Васильевич	1
+242	Иванов	Пётр	Петрович	1
+243	Чесноков	Сергей	Сергеевич	1
+244	Гончаров	Сергей	Сергеевич	1
+245	Гончаров	Вадим	Андреевич	1
+246	Гончаров	Валерий	Васильевич	1
+247	Сидоров	Валерий	Иванович	1
+248	Петров	Анатолий	Анатольевич	1
+249	Ушаков	Сергей	Анатольевич	1
+250	Гончаров	Вадим	Иванович	1
+\.
+
+
+--
+-- Name: personnel_p_id_seq; Type: SEQUENCE SET; Schema: public; Owner: administrator
+--
+
+SELECT pg_catalog.setval('public.personnel_p_id_seq', 250, true);
+
+
+--
+-- Data for Name: personnel_status; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.personnel_status (id, shortname, description) FROM stdin;
+1	В строю	\N
+2	Отпуск	Регулярный отпуск для военнослужащих
+3	Больничный	Оформлен больничный лист
+\.
+
+
+--
+-- Name: personnel_status_id_seq; Type: SEQUENCE SET; Schema: public; Owner: administrator
+--
+
+SELECT pg_catalog.setval('public.personnel_status_id_seq', 4, true);
+
+
+--
+-- Data for Name: radar_station; Type: TABLE DATA; Schema: public; Owner: administrator
+--
+
+COPY public.radar_station (name, range, n_persons) FROM stdin;
+Небо-У	320	3
+Гамма-С1Е	350	3
+Противник-ГЕ	340	3
+5Н84А Оборона-14	300	12
+\.
+
+
+--
+-- Name: duty_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.duty_groups
+    ADD CONSTRAINT duty_groups_pkey PRIMARY KEY (gr_id);
+
+
+--
+-- Name: group_person_pk; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.groups_personnel
+    ADD CONSTRAINT group_person_pk PRIMARY KEY (gr_id, p_id);
+
+
+--
+-- Name: groups_personnel_p_id_key; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.groups_personnel
+    ADD CONSTRAINT groups_personnel_p_id_key UNIQUE (p_id);
+
+
+--
+-- Name: inventory_pkey; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.inventory
+    ADD CONSTRAINT inventory_pkey PRIMARY KEY (serial_number);
+
+
+--
+-- Name: log_pk; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.duty_groups_log
+    ADD CONSTRAINT log_pk PRIMARY KEY (duty_start, duty_end, equipment);
+
+
+--
+-- Name: personnel_pkey; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.personnel
+    ADD CONSTRAINT personnel_pkey PRIMARY KEY (p_id);
+
+
+--
+-- Name: personnel_status_pkey; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.personnel_status
+    ADD CONSTRAINT personnel_status_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: personnel_status_shortname_key; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.personnel_status
+    ADD CONSTRAINT personnel_status_shortname_key UNIQUE (shortname);
+
+
+--
+-- Name: radar_station_pkey; Type: CONSTRAINT; Schema: public; Owner: administrator; Tablespace: 
+--
+
+ALTER TABLE ONLY public.radar_station
+    ADD CONSTRAINT radar_station_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: commander_check; Type: TRIGGER; Schema: public; Owner: administrator
+--
+
+CREATE TRIGGER commander_check BEFORE INSERT OR UPDATE ON public.duty_groups_log FOR EACH ROW EXECUTE PROCEDURE public.check_commander();
+
+
+--
+-- Name: duty_groups_for_station_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.duty_groups
+    ADD CONSTRAINT duty_groups_for_station_fkey FOREIGN KEY (for_station) REFERENCES public.radar_station(name) ON DELETE SET NULL;
+
+
+--
+-- Name: duty_groups_log_equipment_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.duty_groups_log
+    ADD CONSTRAINT duty_groups_log_equipment_fkey FOREIGN KEY (equipment) REFERENCES public.inventory(serial_number);
+
+
+--
+-- Name: duty_groups_log_gr_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.duty_groups_log
+    ADD CONSTRAINT duty_groups_log_gr_id_fkey FOREIGN KEY (gr_id) REFERENCES public.duty_groups(gr_id) ON DELETE SET NULL;
+
+
+--
+-- Name: groups_personnel_gr_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.groups_personnel
+    ADD CONSTRAINT groups_personnel_gr_id_fkey FOREIGN KEY (gr_id) REFERENCES public.duty_groups(gr_id) ON DELETE CASCADE;
+
+
+--
+-- Name: groups_personnel_p_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.groups_personnel
+    ADD CONSTRAINT groups_personnel_p_id_fkey FOREIGN KEY (p_id) REFERENCES public.personnel(p_id) ON DELETE CASCADE;
+
+
+--
+-- Name: inventory_rs_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.inventory
+    ADD CONSTRAINT inventory_rs_name_fkey FOREIGN KEY (rs_name) REFERENCES public.radar_station(name) ON DELETE RESTRICT;
+
+
+--
+-- Name: personnel_status_fkey; Type: FK CONSTRAINT; Schema: public; Owner: administrator
+--
+
+ALTER TABLE ONLY public.personnel
+    ADD CONSTRAINT personnel_status_fkey FOREIGN KEY (status) REFERENCES public.personnel_status(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: postgres
+--
+
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM postgres;
+GRANT ALL ON SCHEMA public TO postgres;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+
+
+--
+-- Name: FUNCTION get_groups(fortime timestamp with time zone, relaxdayslimit integer); Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) FROM administrator;
+GRANT ALL ON FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) TO administrator;
+GRANT ALL ON FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) TO PUBLIC;
+GRANT ALL ON FUNCTION public.get_groups(fortime timestamp with time zone, relaxdayslimit integer) TO authority;
+
+
+--
+-- Name: TABLE duty_groups; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.duty_groups FROM PUBLIC;
+REVOKE ALL ON TABLE public.duty_groups FROM administrator;
+GRANT ALL ON TABLE public.duty_groups TO administrator;
+GRANT SELECT ON TABLE public.duty_groups TO people;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.duty_groups TO authority;
+
+
+--
+-- Name: SEQUENCE duty_groups_gr_id_seq; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON SEQUENCE public.duty_groups_gr_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.duty_groups_gr_id_seq FROM administrator;
+GRANT ALL ON SEQUENCE public.duty_groups_gr_id_seq TO administrator;
+GRANT ALL ON SEQUENCE public.duty_groups_gr_id_seq TO authority;
+
+
+--
+-- Name: TABLE duty_groups_log; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.duty_groups_log FROM PUBLIC;
+REVOKE ALL ON TABLE public.duty_groups_log FROM administrator;
+GRANT ALL ON TABLE public.duty_groups_log TO administrator;
+GRANT SELECT ON TABLE public.duty_groups_log TO people;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.duty_groups_log TO authority;
+
+
+--
+-- Name: TABLE groups_personnel; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.groups_personnel FROM PUBLIC;
+REVOKE ALL ON TABLE public.groups_personnel FROM administrator;
+GRANT ALL ON TABLE public.groups_personnel TO administrator;
+GRANT SELECT ON TABLE public.groups_personnel TO people;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.groups_personnel TO authority;
+
+
+--
+-- Name: TABLE radar_station; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.radar_station FROM PUBLIC;
+REVOKE ALL ON TABLE public.radar_station FROM administrator;
+GRANT ALL ON TABLE public.radar_station TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.radar_station TO authority;
+
+
+--
+-- Name: TABLE duty_groups_people; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.duty_groups_people FROM PUBLIC;
+REVOKE ALL ON TABLE public.duty_groups_people FROM administrator;
+GRANT ALL ON TABLE public.duty_groups_people TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.duty_groups_people TO authority;
+
+
+--
+-- Name: TABLE personnel; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.personnel FROM PUBLIC;
+REVOKE ALL ON TABLE public.personnel FROM administrator;
+GRANT ALL ON TABLE public.personnel TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.personnel TO authority;
+
+
+--
+-- Name: TABLE group_info; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.group_info FROM PUBLIC;
+REVOKE ALL ON TABLE public.group_info FROM administrator;
+GRANT ALL ON TABLE public.group_info TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.group_info TO authority;
+
+
+--
+-- Name: TABLE inventory; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.inventory FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory FROM administrator;
+GRANT ALL ON TABLE public.inventory TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.inventory TO authority;
+
+
+--
+-- Name: TABLE inventory_info; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.inventory_info FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_info FROM administrator;
+GRANT ALL ON TABLE public.inventory_info TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.inventory_info TO authority;
+
+
+--
+-- Name: TABLE inventory_usage; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.inventory_usage FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_usage FROM administrator;
+GRANT ALL ON TABLE public.inventory_usage TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.inventory_usage TO authority;
+
+
+--
+-- Name: TABLE personnel_status; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.personnel_status FROM PUBLIC;
+REVOKE ALL ON TABLE public.personnel_status FROM administrator;
+GRANT ALL ON TABLE public.personnel_status TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.personnel_status TO authority;
+
+
+--
+-- Name: TABLE personnel_info; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON TABLE public.personnel_info FROM PUBLIC;
+REVOKE ALL ON TABLE public.personnel_info FROM administrator;
+GRANT ALL ON TABLE public.personnel_info TO administrator;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.personnel_info TO authority;
+
+
+--
+-- Name: SEQUENCE personnel_p_id_seq; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON SEQUENCE public.personnel_p_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.personnel_p_id_seq FROM administrator;
+GRANT ALL ON SEQUENCE public.personnel_p_id_seq TO administrator;
+GRANT ALL ON SEQUENCE public.personnel_p_id_seq TO authority;
+
+
+--
+-- Name: SEQUENCE personnel_status_id_seq; Type: ACL; Schema: public; Owner: administrator
+--
+
+REVOKE ALL ON SEQUENCE public.personnel_status_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.personnel_status_id_seq FROM administrator;
+GRANT ALL ON SEQUENCE public.personnel_status_id_seq TO administrator;
+GRANT ALL ON SEQUENCE public.personnel_status_id_seq TO authority;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
